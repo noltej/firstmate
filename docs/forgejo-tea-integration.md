@@ -104,7 +104,7 @@ It never splits the output line by line, because a login printed as one compact 
 
 ## URL shape
 
-Forgejo (and Gitea) serve pull requests at `https://<host>/<owner>/<repo>/pulls/<number>` - plural "pulls", no `/-/` route separator, confirmed by the fixture's own PR-creation output:
+Forgejo (and Gitea) serve pull requests at `<scheme>://<host>[:<port>]/<owner>/<repo>/pulls/<number>` - plural "pulls", no `/-/` route separator, confirmed by the fixture's own PR-creation output:
 
 ```
 $ tea pulls create --login fm-fixture --repo fixture/fixture-repo --head merged-branch --base main --title "..."
@@ -113,6 +113,11 @@ $ tea pulls create --login fm-fixture --repo fixture/fixture-repo --head merged-
 ```
 
 This never collides with GitHub's `.../pull/<n>` (singular), GitLab's `.../-/merge_requests/<n>`, or Gerrit's `.../c/<project>/+/<n>`.
+
+The scheme and port come from the instance's own `ROOT_URL`, and every reporter repeats that URL verbatim: the instance, `tea`, and no-mistakes all printed `http://localhost:3980/fixture/fixture/pulls/<n>` for a Forgejo 16.0.6 instance with `ROOT_URL=http://localhost:3980/` (2026-10-13 trial below).
+Firstmate therefore accepts a Forgejo URL with `http` or `https` and an optional explicit port, keeps it exactly as printed as the pull request's identity, and resolves the `tea` login from the bare hostname; GitHub, GitLab, and Gerrit URLs stay `https`-only with no port.
+`fm_pr_url_parse` in `bin/fm-pr-lib.sh` owns the accepted shapes, and `tests/fm-pr-check-security.test.sh` pins them, including the refused non-canonical ports.
+Before this, Firstmate refused the printed URL outright (`error: invalid PR check request`), so a local instance off port 443 or without TLS could not be armed, watched, or merged.
 
 ## End to end: arming and polling a real pull request
 
@@ -138,7 +143,8 @@ $ state/task-f1.check.sh
 merged
 ```
 
-The `localhost:3980` login's actual port never appears in the canonical PR URL or the poll's host comparison - login matching only ever compares bare hostnames - so this reproduces correctly for an instance reachable on the standard port with no explicit port in its URL, which is the realistic self-hosted shape.
+This 2026-09-13 run addressed the instance as `https://localhost/...` with no port; login matching only ever compares bare hostnames, so the `localhost:3980` login still served it.
+The URL the instance actually prints, `http://localhost:3980/...`, is accepted as-is since the URL-shape change above.
 
 ## A missing tea produces no wake, never a false merge
 
@@ -204,8 +210,70 @@ error: refusing to merge ...
   - the combined commit status is "none", not success
 ```
 
-**Not verified here:** the shape of a populated (non-empty) combined-status response from a real Forgejo Actions run, its pagination, and the pull request `draft` field.
-Standing up a Forgejo Actions runner was out of scope for this pass; the merge gate requires the combined status's `state` field to read exactly `success`, matching GitHub's and GitLab's own state enums, and refuses on anything else including an unrecognized value - the same fail-safe-refuse posture as every other condition here.
+The merge gate requires the combined status's `state` field to read exactly `success` on every non-empty page, matching GitHub's and GitLab's own state enums, and refuses on anything else including an unrecognized value.
+The next section records that gate against real Forgejo Actions results.
+
+## Real Forgejo Actions results
+
+Verified 2026-10-13/14 against a disposable Forgejo `16.0.6` (`/api/v1/version` -> `16.0.6+gitea-1.22.0`) with Actions enabled, `forgejo/runner` `13.2.0`, and `tea` `0.16.0`, using real pull requests and real Actions runs; the instance was destroyed afterward.
+These requests used the `https://localhost/...` spelling because Firstmate did not yet accept the printed `http://localhost:3980/...` URL; the login is matched by bare hostname, so all traffic reached the real instance.
+
+A populated combined status (`tea api '/repos/{owner}/{repo}/commits/<sha>/status?limit=50&page=1'`) for a green run:
+
+```json
+{"state":"success","sha":"6cfc8048...","total_count":1,
+ "statuses":[{"id":3,"status":"success","target_url":"/fixture/fixture/actions/runs/2/jobs/0",
+   "description":"Successful in 21s","context":"CI / build-test (push)","creator":null, ...}],
+ "commit_url":"","url":""}
+```
+
+- Each status carries its outcome in `status`, not GitHub's `state`; the gate reads only the top-level `state` and each page's array length.
+- Contexts are named `<workflow name> / <job> (<event>)`, and `target_url` is relative.
+- Per-status values seen were `success`, `failure`, `pending` while running, and `skipped` for an `if:`-false job.
+- The combined `state` of `success` plus `skipped` is `success`, a running job gives `pending`, and a failing job gives `failure`.
+- `total_count` counts that page only, the default page size is 30, and an empty page reads `{"state":"","sha":"","total_count":0,"statuses":null}`.
+- The most recently updated contexts come first, the oldest land on the last page, and each page's `state` covers only that page.
+
+A failure hidden behind 55 newer green contexts sits on page 2, so a single-page read would merge a red pull request:
+
+```
+?limit=50&page=1  {"state":"success","n":50}
+?limit=50&page=2  {"state":"failure","n":8,"nonsuccess":[{"context":"aa-early-failure","status":"failure"}]}
+?limit=50&page=3  {"state":"","n":0}
+```
+
+`bin/fm-pr-merge.sh` against pull requests 2 (red run), 3 (still running), 5 (`WIP:` draft), 8 (failure only on page 2), 1 (green), 4 (green with a skipped job), and 6 (57 contexts over two pages):
+
+```
+$ fm-pr-merge.sh task-red https://localhost/fixture/fixture/pulls/2
+error: refusing to merge https://localhost/fixture/fixture/pulls/2
+  - the combined commit status is "failure", not success
+$ fm-pr-merge.sh task-slow https://localhost/fixture/fixture/pulls/3
+error: refusing to merge https://localhost/fixture/fixture/pulls/3
+  - the combined commit status is "pending", not success
+$ fm-pr-merge.sh task-draft https://localhost/fixture/fixture/pulls/5
+error: refusing to merge https://localhost/fixture/fixture/pulls/5
+  - mergeable is "false", not true
+  - the pull request is a draft
+$ fm-pr-merge.sh task-page-late https://localhost/fixture/fixture/pulls/8
+error: refusing to merge https://localhost/fixture/fixture/pulls/8
+  - the combined commit status is "failure", not success
+$ fm-pr-merge.sh task-green https://localhost/fixture/fixture/pulls/1
+verified: https://localhost/fixture/fixture/pulls/1 is open and mergeable, with a successful combined status at head d974aae8...
+$ fm-pr-merge.sh task-skip https://localhost/fixture/fixture/pulls/4 -- --squash
+verified: ... successful combined status at head 0c1d4dd6...
+$ fm-pr-merge.sh task-page-green https://localhost/fixture/fixture/pulls/6
+verified: ... successful combined status at head 7e3c778e...
+```
+
+Pull request 1 read back as `{"number":1,"state":"closed","merged":true,...}`, and pull request 4 landed as one squash commit on `main`.
+
+The pull request record on Forgejo 16 carries a boolean `draft`, and a `WIP:` title gives `draft: true` and `mergeable: false`.
+A merge call on a pull request whose mergeability is not yet settled, or that conflicts, answers `405 {"message":"Please try again later"}` with `tea` exit status 0, which the read-back after every merge call already treats as not merged.
+The by-number merge watch reported `merged` after the merge, the crew-state read and teardown's merged-pull-request proof read the same record correctly, and Forgejo served `refs/pull/<n>/head` for every pull request.
+
+Arming a merge watch now also refuses a Forgejo draft, reading that same `draft` field, as it already did for a GitHub draft (`bin/fm-pr-check.sh`); the 2026-10-13 trial showed the earlier arming path accepting a draft (`armed: state/task-draft.check.sh`), while the merge-time refusal above still held.
+`tea` `0.16.0`'s `tea pulls <n> --output json` now prints structured JSON including `headSha`, unlike the development build recorded above; Firstmate still reads the `tea api` record, which every release serves the same way.
 
 ## Registered `tea login`s used
 
