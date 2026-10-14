@@ -190,7 +190,24 @@ case "$provider" in
         .|..|*.git|*[!A-Za-z0-9._-]*) exit 0 ;;
       esac
     done
-    [ "$url" = "https://$host/$owner/$repo/pulls/$number" ] || exit 0
+    # A Forgejo URL keeps the scheme and any explicit port its instance prints
+    # (bin/fm-pr-lib.sh's fm_pr_url_parse), so only those two parts may vary:
+    # http or https, and a canonical port of 1-65535 with no leading zero.
+    # Everything else must still rebuild exactly from the validated components.
+    origin=${url%%/"$owner"/"$repo"/pulls/"$number"}
+    [ "$origin" != "$url" ] || exit 0
+    case "$origin" in
+      "https://$host"|"http://$host") ;;
+      "https://$host:"*|"http://$host:"*)
+        port=${origin#http*://"$host":}
+        case "$port" in
+          ''|0*|*[!0-9]*) exit 0 ;;
+        esac
+        [ "${#port}" -le 5 ] && [ "$port" -le 65535 ] || exit 0
+        ;;
+      *) exit 0 ;;
+    esac
+    [ "$url" = "$origin/$owner/$repo/pulls/$number" ] || exit 0
     command -v tea >/dev/null 2>&1 || exit 0
     command -v jq >/dev/null 2>&1 || exit 0
     # tea addresses a repo by slug only; the host comes from a named login
@@ -219,8 +236,8 @@ case "$provider" in
         end' 2>/dev/null
     ) || exit 0
     [ -n "$login" ] || exit 0
-    # tea's single-PR view ignores field selection, so the one pull request
-    # is read by number from the REST record through "tea api", which keeps
+    # tea's single-PR view has not honored field selection in every release,
+    # so the one pull request is read by number from the REST record through "tea api", which keeps
     # the credential inside tea. "tea api" exits 0 on an HTTP error with the
     # error body as output, so only a boolean merged field of true wakes this
     # poll and every other reading stays silent.

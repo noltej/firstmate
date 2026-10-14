@@ -275,22 +275,45 @@ fm_pr_url_parse() {
   # Forgejo/Gitea serve pulls at owner/repo/pulls/<n>: plural "pulls", no "/-/"
   # route separator and no "/+/" change separator, so this shape never collides
   # with the GitLab or Gerrit patterns above.
-  pattern='^https://([a-z0-9.-]{1,253})/([A-Za-z0-9._-]{1,100})/([A-Za-z0-9._-]{1,100})/pulls/([1-9][0-9]*)$'
+  # A Forgejo instance prints its pull request URLs from its own ROOT_URL, and
+  # a self-hosted one is routinely served over plain http or on a non-default
+  # port, so this one shape also accepts http and an explicit port; the URL is
+  # kept exactly as the forge printed it. The host stays the bare hostname,
+  # because tea resolves its login by bare hostname (fm_pr_forgejo_login), and
+  # the scheme and port stay only in FM_PR_URL, the identity every record
+  # compares. GitHub, GitLab, and Gerrit stay https-only with no port.
+  pattern='^(https?)://([a-z0-9.-]{1,253})(:[0-9]{1,5})?/([A-Za-z0-9._-]{1,100})/([A-Za-z0-9._-]{1,100})/pulls/([1-9][0-9]*)$'
   [[ "$raw" =~ $pattern ]] || return 1
-  host=${BASH_REMATCH[1]}
+  host=${BASH_REMATCH[2]}
   fm_pr_forge_host_valid "$host" || return 1
-  fm_pr_forgejo_segment_valid "${BASH_REMATCH[2]}" || return 1
-  fm_pr_forgejo_segment_valid "${BASH_REMATCH[3]}" || return 1
+  fm_pr_url_port_valid "${BASH_REMATCH[3]}" || return 1
+  fm_pr_forgejo_segment_valid "${BASH_REMATCH[4]}" || return 1
+  fm_pr_forgejo_segment_valid "${BASH_REMATCH[5]}" || return 1
   FM_PR_PROVIDER=forgejo
   FM_PR_URL=$raw
   FM_PR_HOST=$host
-  FM_PR_PATH="${BASH_REMATCH[2]}/${BASH_REMATCH[3]}"
+  FM_PR_PATH="${BASH_REMATCH[4]}/${BASH_REMATCH[5]}"
   # Consumed by bin/fm-pr-merge.sh, which addresses Forgejo by owner/repository.
   # shellcheck disable=SC2034
-  FM_PR_OWNER=${BASH_REMATCH[2]}
+  FM_PR_OWNER=${BASH_REMATCH[4]}
   # shellcheck disable=SC2034
-  FM_PR_REPO=${BASH_REMATCH[3]}
-  FM_PR_NUMBER=${BASH_REMATCH[4]}
+  FM_PR_REPO=${BASH_REMATCH[5]}
+  FM_PR_NUMBER=${BASH_REMATCH[6]}
+}
+
+# An explicit URL port, given with its leading ":", or empty for none. Only the
+# canonical decimal spelling of 1-65535 is accepted: no leading zero, so one
+# port has one spelling and two records of the same pull request always
+# compare equal.
+fm_pr_url_port_valid() {
+  local port=${1-}
+  local LC_ALL=C
+  [ -n "$port" ] || return 0
+  port=${port#:}
+  case "$port" in
+    ''|0*|*[!0-9]*) return 1 ;;
+  esac
+  [ "${#port}" -le 5 ] && [ "$port" -le 65535 ]
 }
 
 fm_pr_head_valid() {
@@ -307,6 +330,25 @@ fm_pr_head_valid() {
 fm_pr_json_draft_state() {  # <pull-request-json>
   printf '%s' "${1-}" | jq -r '
     if type == "object" and (.isDraft | type) == "boolean" then (.isDraft | tostring) else "" end
+  ' 2>/dev/null || true
+}
+
+# The draft state of one Forgejo pull request as "true" or "false", or empty
+# when it cannot be read. It comes from the same "tea api" REST record the
+# merge path reads, whose draft field is a boolean that Forgejo sets from a
+# work-in-progress title prefix such as "WIP:". "tea api" exits 0 on an HTTP
+# error with the error body as output, and that body has no boolean draft
+# field, so a failed read is empty rather than a false "not a draft".
+fm_pr_forgejo_draft_state() {  # <host> <path> <number>
+  local host=$1 path=$2 number=$3 login
+  case "$number" in
+    ''|*[!0-9]*) return 0 ;;
+  esac
+  command -v jq >/dev/null 2>&1 || return 0
+  login=$(fm_pr_forgejo_login "$host") || return 0
+  [ -n "$login" ] || return 0
+  tea api --login "$login" --repo "$path" "/repos/{owner}/{repo}/pulls/$number" 2>/dev/null | jq -r '
+    if type == "object" and (.draft | type) == "boolean" then (.draft | tostring) else "" end
   ' 2>/dev/null || true
 }
 

@@ -2277,6 +2277,34 @@ test_forgejo_login_resolves_from_the_host() {
   pass "fm-pr-merge resolves the tea login by matching the PR's host against every registered login"
 }
 
+# A local Forgejo prints its pull request URLs from its ROOT_URL, such as
+# http://localhost:3980/..., and that exact URL is what a worker or the
+# pipeline reports. It merges through the login for its bare host and is
+# recorded exactly as printed.
+test_forgejo_http_url_with_port_merges() {
+  local case_dir rc url merge_line
+  url="http://localhost:3980/$FJ_OWNER/$FJ_REPO/pulls/9"
+  case_dir=$(make_forgejo_case forgejo-http-port)
+  write_tea_logins_json "$case_dir/tea-logins.json" \
+    other "https://unrelated.example" "$FJ_LOGIN" "http://localhost:3980"
+
+  set +e
+  run_pr_merge "$case_dir" task-x1 "$url" \
+    > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  expect_code 0 "$rc" "forgejo-http-port: an http pull request URL with a port should merge, not be refused as invalid"
+  assert_grep "pr=$url" "$case_dir/state/task-x1.meta" \
+    "forgejo-http-port: pr= was not recorded exactly as the instance printed it"
+  merge_line=$(tea_merge_line "$case_dir/tea.log")
+  case "$merge_line" in
+    *"--login $FJ_LOGIN --repo $FJ_OWNER/$FJ_REPO -X POST /repos/{owner}/{repo}/pulls/9/merge -f Do=merge -f head_commit_id=$FJ_HEAD"*) : ;;
+    *) fail "forgejo-http-port: unexpected merge invocation: '$merge_line'" ;;
+  esac
+  pass "fm-pr-merge merges a Forgejo pull request addressed by an http URL with a port"
+}
+
 test_forgejo_refuses_when_login_is_ambiguous() {
   local case_dir rc name
   for name in none two; do
@@ -2978,6 +3006,7 @@ test_gitlab_invalid_head_refuses
 test_gitlab_missing_tool_refuses_before_recording
 test_forgejo_url_resolves_and_merges
 test_forgejo_login_resolves_from_the_host
+test_forgejo_http_url_with_port_merges
 test_forgejo_refuses_when_login_is_ambiguous
 test_forgejo_each_condition_refuses_independently
 test_forgejo_unconfigured_ci_refuses_as_none

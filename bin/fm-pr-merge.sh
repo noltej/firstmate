@@ -629,9 +629,9 @@ FIELDS
 }
 
 # Pre-merge conditions for a Forgejo pull request, read from one live view of
-# it. tea's single-PR view ignores field selection entirely (verified against
-# a real instance), so the raw API is read directly through "tea api" instead
-# of any tea subcommand, exactly like glab's JSON view above but through
+# it. tea's single-PR view has not honored field selection in every release
+# (docs/forgejo-tea-integration.md), so the raw API is read directly through
+# "tea api" instead of any tea subcommand, exactly like glab's JSON view above but through
 # Forgejo/Gitea's REST API. Sets FM_PR_MERGE_HEAD to the verified head on
 # success and returns non-zero after reporting every condition that failed.
 #

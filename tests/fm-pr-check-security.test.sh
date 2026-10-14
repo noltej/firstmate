@@ -534,16 +534,47 @@ EOF
   done <<'EOF'
 https://git.example.com/fixture/fixture-repo/pulls/1|git.example.com|fixture|fixture-repo|1
 https://code.internal/my-org/repo.name_with-parts/pulls/123456|code.internal|my-org|repo.name_with-parts|123456
+http://localhost:3980/fixture/fixture/pulls/1|localhost|fixture|fixture|1
+http://code.internal/o/r/pulls/3|code.internal|o|r|3
+https://git.example.com:8443/o/r/pulls/2|git.example.com|o|r|2
+https://localhost:65535/o/r/pulls/4|localhost|o|r|4
+http://10.0.0.5:1/o/r/pulls/5|10.0.0.5|o|r|5
 EOF
   # A Forgejo-shaped URL on github.com is refused (anti-spoofing, mirroring
   # fm_pr_forge_host_valid's refusal of github.com), and neither GitHub's
   # singular "pull" nor GitLab's "/-/merge_requests/" is accepted as forgejo.
+  # A Forgejo URL may carry http and a port, but only a canonical port of
+  # 1-65535 with no leading zero, after a bare lowercase host with no userinfo.
   for row in \
     'https://github.com/fixture/fixture-repo/pulls/1' \
+    'http://github.com/fixture/fixture-repo/pulls/1' \
+    'http://github.com:3980/fixture/fixture-repo/pulls/1' \
     'https://git.example.com/fixture/fixture-repo/pull/1' \
-    'https://git.example.com/group/sub/project/pulls/1'
+    'https://git.example.com/group/sub/project/pulls/1' \
+    'http://localhost:0/o/r/pulls/1' \
+    'http://localhost:03980/o/r/pulls/1' \
+    'http://localhost:65536/o/r/pulls/1' \
+    'http://localhost:123456/o/r/pulls/1' \
+    'http://localhost:/o/r/pulls/1' \
+    'http://localhost:3980:80/o/r/pulls/1' \
+    'http://user@localhost:3980/o/r/pulls/1' \
+    'http://LOCALHOST:3980/o/r/pulls/1' \
+    'ftp://localhost/o/r/pulls/1' \
+    'HTTP://localhost/o/r/pulls/1' \
+    'http://localhost:3980/o/r/pulls/01'
   do
     ! fm_pr_url_parse "$row" || fail "parser accepted a URL that must not resolve as forgejo: $row"
+  done
+  # http and a port stay Forgejo-only: the other forges' shapes are unchanged.
+  for row in \
+    'http://github.com/a/b/pull/1' \
+    'https://github.com:8443/a/b/pull/1' \
+    'http://gitlab.example/g/p/-/merge_requests/1' \
+    'https://gitlab.example:8443/g/p/-/merge_requests/1' \
+    'http://gerrit.example/c/proj/+/1' \
+    'https://gerrit.example:8080/c/proj/+/1'
+  do
+    ! fm_pr_url_parse "$row" || fail "parser accepted http or a port outside Forgejo: $row"
   done
   fm_pr_url_parse https://github.com/a/b/pull/1 || fail "parser rejected canonical URL"
   [ "$FM_PR_PROVIDER" = github ] || fail "parser did not tag a pull request URL as github"
@@ -2134,6 +2165,139 @@ SH
   pass "Forgejo login match parses tea's JSON in every line shape, in the helper and the static poll"
 }
 
+# A self-hosted Forgejo prints its pull request URLs from its own ROOT_URL,
+# routinely plain http on a non-default port. Such a URL is armed exactly as
+# printed, the static poll follows it through the host's one tea login, and the
+# poll still rebuilds every other part of the stored URL from its validated
+# components, so a doctored scheme, port, host, or path stays silent.
+test_forgejo_http_port_merge_watch() {
+  local dir state out url bad
+  dir=$(make_case forgejo-http-port)
+  state="$dir/home/state"
+  url=http://localhost:3980/o/r/pulls/7
+  cat > "$dir/fakebin/tea" <<'SH'
+#!/usr/bin/env bash
+if [ "${1:-} ${2:-}" = "login list" ]; then
+  printf '[{"name":"local","url":"http://localhost:3980"}]\n'
+  exit 0
+fi
+[ "${1:-}" = api ] || exit 0
+printf '%s\n' "$*" >> "$FM_TEST_TEA_LOG"
+case " $* " in
+  *"/pulls/7 "*) printf '{"state":"open","merged":false,"draft":false,"head":{"sha":"abc"}}\n' ;;
+esac
+SH
+  chmod +x "$dir/fakebin/tea"
+  ln -sf "$(command -v jq)" "$dir/fakebin/jq"
+  : > "$dir/tea.log"
+
+  write_task_meta "$dir"
+  FM_TEST_TEA_LOG="$dir/tea.log" run_check_entry "$dir" task-a "$url" \
+    > "$dir/stdout" 2> "$dir/stderr" || fail "arming refused an http Forgejo URL with a port: $(cat "$dir/stderr")"
+  grep -qxF "pr=$url" "$state/task-a.meta" || fail "the http Forgejo URL was not recorded exactly as printed"
+  [ "$(sed -n 2p "$state/task-a.pr-poll")" = "$url" ] || fail "the poll sidecar did not keep the URL as printed"
+  [ "$(sed -n 3p "$state/task-a.pr-poll")" = localhost ] || fail "the poll sidecar host is not the bare hostname"
+
+  cat > "$dir/fakebin/tea" <<'SH'
+#!/usr/bin/env bash
+if [ "${1:-} ${2:-}" = "login list" ]; then
+  printf '[{"name":"local","url":"http://localhost:3980"}]\n'
+  exit 0
+fi
+[ "${1:-}" = api ] || exit 0
+printf '%s\n' "$*" >> "$FM_TEST_TEA_LOG"
+printf '{"state":"closed","merged":true,"head":{"sha":"abc"}}\n'
+SH
+  : > "$dir/tea.log"
+  out=$(FM_TEST_TEA_LOG="$dir/tea.log" run_poll "$dir")
+  [ "$out" = merged ] || fail "the armed http Forgejo poll did not report the merge"
+  grep -qF -- "api --login local --repo o/r /repos/{owner}/{repo}/pulls/7" "$dir/tea.log" \
+    || fail "the http Forgejo poll did not read through the host's login"
+
+  # The control case proves the direct invocation below can report a merge,
+  # so each doctored URL's silence is the poll's own refusal.
+  out=$(PATH="$dir/fakebin:$BASE_PATH" FM_TEST_TEA_LOG="$dir/tea.log" \
+    bash "$POLL" --validated forgejo "$url" localhost o/r 7)
+  [ "$out" = merged ] || fail "the validated http Forgejo poll did not report the merge"
+  for bad in \
+    'http://localhost:3980:80/o/r/pulls/7' \
+    'https://localhost:03980/o/r/pulls/7' \
+    'http://localhost:65536/o/r/pulls/7' \
+    'http://localhost:/o/r/pulls/7' \
+    'http://localhost.evil:3980/o/r/pulls/7' \
+    'http://evil.example/localhost/o/r/pulls/7' \
+    'ftp://localhost:3980/o/r/pulls/7' \
+    'http://localhost:3980/o/other/pulls/7' \
+    'http://localhost:3980/o/r/pulls/8' \
+    'http://user@localhost:3980/o/r/pulls/7'
+  do
+    out=$(PATH="$dir/fakebin:$BASE_PATH" FM_TEST_TEA_LOG="$dir/tea.log" \
+      bash "$POLL" --validated forgejo "$bad" localhost o/r 7)
+    [ -z "$out" ] || fail "the Forgejo poll followed a doctored URL: $bad"
+  done
+  pass "an http Forgejo URL with a port is armed as printed and polled, and a doctored one stays silent"
+}
+
+# A Forgejo pull request that is a draft (a work-in-progress title prefix) is
+# refused at arming, like a GitHub draft, from the same tea api record the
+# merge path reads. A ready pull request and an unreadable draft state arm.
+test_forgejo_draft_pull_request_is_not_armed() {
+  local dir rc url
+  url=http://localhost:3980/o/r/pulls/5
+  for dir in draft-forgejo-refused draft-forgejo-cleared draft-forgejo-unreadable; do
+    dir=$(make_case "$dir")
+    cat > "$dir/fakebin/tea" <<'SH'
+#!/usr/bin/env bash
+if [ "${1:-} ${2:-}" = "login list" ]; then
+  printf '[{"name":"local","url":"http://localhost:3980"}]\n'
+  exit 0
+fi
+[ "${1:-}" = api ] || exit 0
+case "${FM_TEST_TEA_DRAFT:-false}" in
+  true) printf '{"state":"open","merged":false,"draft":true,"mergeable":false,"head":{"sha":"abc"}}\n' ;;
+  error) printf '{"message":"The target couldn'"'"'t be found.","url":"x"}\n' ;;
+  *) printf '{"state":"open","merged":false,"draft":false,"mergeable":true,"head":{"sha":"abc"}}\n' ;;
+esac
+SH
+    chmod +x "$dir/fakebin/tea"
+    ln -sf "$(command -v jq)" "$dir/fakebin/jq"
+    write_task_meta "$dir"
+  done
+
+  dir="$TMP_ROOT/draft-forgejo-refused"
+  cp "$dir/home/state/task-a.meta" "$dir/meta.before"
+  set +e
+  FM_TEST_TEA_DRAFT=true run_check_entry "$dir" task-a "$url" > "$dir/stdout" 2> "$dir/stderr"; rc=$?
+  set -e
+  [ "$rc" -ne 0 ] || fail "arming accepted a Forgejo draft pull request"
+  grep -qi 'draft' "$dir/stderr" || fail "the Forgejo refusal did not name the draft state"
+  grep -qF "$url" "$dir/stderr" || fail "the Forgejo refusal did not name the pull request"
+  cmp -s "$dir/meta.before" "$dir/home/state/task-a.meta" || fail "a refused Forgejo draft changed the task metadata"
+  [ ! -e "$dir/home/state/task-a.check.sh" ] || fail "a refused Forgejo draft armed a poll"
+  [ ! -e "$dir/home/state/task-a.pr-poll" ] || fail "a refused Forgejo draft wrote a poll sidecar"
+  [ ! -s "$dir/guard.log" ] || fail "a refused Forgejo draft reached the guard"
+
+  dir="$TMP_ROOT/draft-forgejo-cleared"
+  FM_TEST_TEA_DRAFT=false run_check_entry "$dir" task-a "$url" > "$dir/stdout" 2> "$dir/stderr" \
+    || fail "arming refused a Forgejo pull request that is not a draft: $(cat "$dir/stderr")"
+  [ -f "$dir/home/state/task-a.check.sh" ] || fail "a ready Forgejo pull request was not armed"
+
+  dir="$TMP_ROOT/draft-forgejo-unreadable"
+  FM_TEST_TEA_DRAFT=error run_check_entry "$dir" task-a "$url" > "$dir/stdout" 2> "$dir/stderr" \
+    || fail "an unreadable Forgejo draft state blocked arming: $(cat "$dir/stderr")"
+  [ -f "$dir/home/state/task-a.check.sh" ] || fail "an unreadable Forgejo draft state was not armed"
+
+  # The merge path records through arming with FM_PR_CHECK_MERGE=1 and owns its
+  # own draft refusal, so arming there skips this read.
+  dir=$(make_case draft-forgejo-merge-path)
+  cp "$TMP_ROOT/draft-forgejo-refused/fakebin/tea" "$dir/fakebin/tea"
+  ln -sf "$(command -v jq)" "$dir/fakebin/jq"
+  write_task_meta "$dir"
+  FM_PR_CHECK_MERGE=1 FM_TEST_TEA_DRAFT=true run_check_entry "$dir" task-a "$url" \
+    > "$dir/stdout" 2> "$dir/stderr" || fail "the merge path's own recording was refused as a draft: $(cat "$dir/stderr")"
+  pass "arming refuses a Forgejo draft pull request, naming it, and arms a ready or unreadable one"
+}
+
 test_gitlab_merge_watch() {
   local dir state out rc url value noglab entry bindir name
   dir=$(make_case gitlab-merge-watch)
@@ -3606,6 +3770,8 @@ test_parser_matrix
 test_gitlab_merge_watch
 test_forgejo_merge_watch
 test_forgejo_login_list_shapes
+test_forgejo_http_port_merge_watch
+test_forgejo_draft_pull_request_is_not_armed
 test_gerrit_merge_watch
 test_gerrit_arming_records_no_patch_set_revision
 test_gerrit_ready_gate_reads_the_published_tree
